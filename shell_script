@@ -1,0 +1,181 @@
+// MAGIC %sh
+// MAGIC current_date=$(date)
+// MAGIC export reporting_date=$(date -d "${current_date}+1 month" +%Y-%m)-01
+// MAGIC export PARALLELISM=20
+// MAGIC echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: Starting JSON file stitch for $reporting_date..."
+// MAGIC 
+// MAGIC #### create the header. this is done externally via spark ####
+// MAGIC 
+// MAGIC #### create the body. we will remove the duplicates from the array of ecn ids to process ####
+// MAGIC 
+// MAGIC cd /dbfs/mnt/ct-inn-body-mount/
+// MAGIC body_array=(*/)
+// MAGIC non_unique_body_array=()
+// MAGIC 
+// MAGIC readarray -t duplicate_ecn_arr </local_disk0/tmp/ecn_list.txt
+// MAGIC for ecn in "${duplicate_ecn_arr[@]}"; do
+// MAGIC     first_ecn=${ecn%:*}
+// MAGIC     other_ecns=${ecn##*:}
+// MAGIC     IFS='|' read -ra other_ecns_arr <<<"$other_ecns"
+// MAGIC     for e in "${other_ecns_arr[@]}"; do
+// MAGIC         element="ecn_id_nm=$e"
+// MAGIC         body_array=("${body_array[@]/$element\//}")
+// MAGIC         non_unique_body_array=("${non_unique_body_array[@]}" "$element/")
+// MAGIC     done
+// MAGIC done
+// MAGIC 
+// MAGIC printf "%s\n" "${body_array[@]}" > /local_disk0/tmp/body_array.txt
+// MAGIC printf "%s\n" "${non_unique_body_array[@]}" > /local_disk0/tmp/non_unique_body_array.txt
+// MAGIC
+// MAGIC create_body() {
+// MAGIC     dir=$1
+// MAGIC     if [[ -n $dir ]]; then
+// MAGIC         ecn_id_nm=$(echo $dir | sed -e "s/ecn_id_nm\=//" | sed -e "s/\///")
+// MAGIC         stitch_start_time=$(date '+%s')
+// MAGIC         echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm: File stitching json fragments from $dir"
+// MAGIC         cd "$dir"
+// MAGIC 
+// MAGIC         # add multi-plan header entries to non-CSN files since they won't be stitched with headers
+// MAGIC         if [[ $ecn_id_nm == CN* ]] | [[ $ecn_id_nm == cn* ]]; then
+// MAGIC             echo "\"in_network\":[" >>/local_disk0/tmp/"$ecn_id_nm".json
+// MAGIC         else
+// MAGIC             echo "{\"reporting_entity_name\": \"Cigna Health Life Insurance Company\",\"reporting_entity_type\": \"Health Insurance Issuer\",\"last_updated_on\": \"${reporting_date}\",\"version\": \"1.0.0\",\"in_network\":[" >>/local_disk0/tmp/"$ecn_id_nm".json
+// MAGIC         fi
+// MAGIC         files=(part*.json)
+// MAGIC         pos=$((${#files[*]} - 1))
+// MAGIC         last=${files[$pos]}
+// MAGIC 
+// MAGIC         for file in "${files[@]}"; do
+// MAGIC             last_line=$(wc -l <$file)
+// MAGIC             current_line=0
+// MAGIC             if [[ $file == $last ]]; then
+// MAGIC                 sed '$!s/$/,/' "$file" >>/local_disk0/tmp/"$ecn_id_nm".json
+// MAGIC             else
+// MAGIC                 sed 's/$/,/' "$file" >>/local_disk0/tmp/"$ecn_id_nm".json
+// MAGIC             fi
+// MAGIC         done
+// MAGIC         echo "]}" >>/local_disk0/tmp/"$ecn_id_nm".json
+// MAGIC 
+// MAGIC         stitch_end_time=$(date '+%s')
+// MAGIC         stitch_total_time=$((($stitch_end_time - $stitch_start_time)))
+// MAGIC         echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm:     File stitching completed for $ecn_id_nm, took a total of $stitch_total_time seconds"
+// MAGIC 
+// MAGIC         compress_start_time=$(date '+%s')
+// MAGIC         echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm: compressing file $ecn_id_nm.json"
+// MAGIC 
+// MAGIC         echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm:     File size of $ecn_id_nm before compression: $(stat -c %s /local_disk0/tmp/$ecn_id_nm.json) bytes"
+// MAGIC 
+// MAGIC         pigz --fast /local_disk0/tmp/"$ecn_id_nm".json
+// MAGIC 
+// MAGIC         compress_end_time=$(date '+%s')
+// MAGIC         compres_total_time=$((($compress_end_time - $compress_start_time)))
+// MAGIC         echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm:     File compression for $ecn_id_nm completed , took a total of $compres_total_time seconds"
+// MAGIC         echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm:     File size of $ecn_id_nm after compression: $(stat -c %s /local_disk0/tmp/$ecn_id_nm.json.gz) bytes"
+// MAGIC         if [[ $ecn_id_nm == CN* ]] | [[ $ecn_id_nm == cn* ]]; then
+// MAGIC             mv /local_disk0/tmp/"$ecn_id_nm".json.gz /dbfs/mnt/ct-datashare-external-output-body-mount/"$ecn_id_nm".json.gz
+// MAGIC         else
+// MAGIC             ecn_nm=$(echo $ecn_id_nm | awk -F! '{ print $2}')
+// MAGIC             out_file="${reporting_date}_cigna-health-life-insurance-company_${ecn_nm}_in-network-rates.json.gz"
+// MAGIC             mv /local_disk0/tmp/"$ecn_id_nm".json.gz /dbfs/mnt/ct-datashare-external-output-mount/"$out_file"
+// MAGIC         fi
+// MAGIC         cd ..
+// MAGIC     fi
+// MAGIC }
+// MAGIC 
+// MAGIC export -f create_body
+// MAGIC 
+// MAGIC echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: Stichting MRF Body for ${#body_array[@]} ECNs"
+// MAGIC parallel --ungroup --jobs $PARALLELISM create_body ::: "${body_array[@]}"
+// MAGIC 
+// MAGIC echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: Completed stichting MRF Body for ${#body_array[@]} ECNs"
+// MAGIC 
+// MAGIC #### check if both header and body exists, if so stitch them together ####
+// MAGIC #### Do this only for CSN products.  ####
+// MAGIC 
+// MAGIC cd /dbfs/mnt/ct-inn-header-mount
+// MAGIC 
+// MAGIC header_array=(*/)
+// MAGIC 
+// MAGIC combine_header_and_body(){
+// MAGIC     dir=$1
+// MAGIC     echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $dir: Processing creation of Header and Body fragments"
+// MAGIC     ecn_id_nm=$(echo $dir | sed -e "s/ecn_id_nm\=//" | sed -e "s/\///")
+// MAGIC 
+// MAGIC     # Perform header and body stitching only for CSN ecns
+// MAGIC     # that begins with 'cn'
+// MAGIC 
+// MAGIC     if [[ $ecn_id_nm == CN* ]] | [[ $ecn_id_nm == cn* ]]; then
+// MAGIC       echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm: Attempting to combine Header and Body fragments"
+// MAGIC       readarray -t _body_array </local_disk0/tmp/body_array.txt
+// MAGIC       readarray -t _non_unique_body_array </local_disk0/tmp/non_unique_body_array.txt
+// MAGIC       readarray -t _duplicate_ecn_arr </local_disk0/tmp/ecn_list.txt
+// MAGIC       cd "$dir"
+// MAGIC       file_name=$(basename $(ls) | sed 's/.json//')
+// MAGIC       if [[ " ${_body_array[*]} " =~ " ${dir} " ]]; then
+// MAGIC           echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm: header and body found"
+// MAGIC           cat /dbfs/mnt/ct-inn-header-mount/ecn_id_nm="$ecn_id_nm"/"$file_name".json | sed 's/.$/,/' | gzip > /local_disk0/tmp/"$ecn_id_nm"_header.json.gz
+// MAGIC           cat /local_disk0/tmp/"$ecn_id_nm"_header.json.gz /dbfs/mnt/ct-datashare-external-output-body-mount/"$ecn_id_nm".json.gz > /local_disk0/tmp/"$file_name".json.gz
+// MAGIC           rm -f /local_disk0/tmp/"$ecn_id_nm"_header.json.gz
+// MAGIC           ecn_nm=$(echo $ecn_id_nm | awk -F! '{ print $2}')
+// MAGIC           out_file="${reporting_date}_cigna-health-life-insurance-company_${ecn_nm}_in-network-rates.json.gz"
+// MAGIC           mv /local_disk0/tmp/"$file_name".json.gz /dbfs/mnt/ct-datashare-external-output-mount/"$out_file"
+// MAGIC           echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm: Completed stitching header and body fragments for $ecn_id_nm"
+// MAGIC       elif [[ " ${_non_unique_body_array[*]} " =~ " ${dir} " ]]; then
+// MAGIC           echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm: header found and body found from duplicate array "
+// MAGIC           for ecn in "${_duplicate_ecn_arr[@]}"; do
+// MAGIC               first_ecn=${ecn%:*}
+// MAGIC               other_ecns=${ecn##*:}
+// MAGIC               IFS='|' read -ra other_ecns_arr <<<"$other_ecns"
+// MAGIC               for e in "${other_ecns_arr[@]}"; do
+// MAGIC                   if [[ "ecn_id=$e/" == "${dir}" ]]; then
+// MAGIC                       echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm: using $first_ecn in place of $e as body"
+// MAGIC                       cat /dbfs/mnt/ct-inn-header-mount/ecn_id_nm="$ecn_id_nm"/"$file_name".json | sed 's/.$/,/' | gzip > /local_disk0/tmp/"$ecn_id_nm"_header.json.gz
+// MAGIC                       cat /local_disk0/tmp/"$ecn_id_nm"_header.json.gz /dbfs/mnt/ct-datashare-external-output-body-mount/"$first_ecn".json.gz > /local_disk0/tmp/"$file_name".json.gz
+// MAGIC                       rm -f /local_disk0/tmp/"$ecn_id_nm"_header.json.gz
+// MAGIC                       ecn_nm=$(echo $ecn_id_nm | awk -F! '{ print $2}')
+// MAGIC                       out_file="${reporting_date}_cigna-health-life-insurance-company_${ecn_nm}_in-network-rates.json.gz"
+// MAGIC                       mv /local_disk0/tmp/"$file_name".json.gz /dbfs/mnt/ct-datashare-external-output-mount/"$out_file"
+// MAGIC                       echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm: Completed stitching header and body using the body fragement from $first_ecn"
+// MAGIC                   fi
+// MAGIC               done
+// MAGIC           done
+// MAGIC       else
+// MAGIC           echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm: skipping MRF generation for $ecn_id_nm due header only found, no body"
+// MAGIC           #cat /dbfs/mnt/ct-inn-header-mount/ecn_id_nm="$ecn_id_nm"/"$file_name".json | gzip > /local_disk0/tmp/"$file_name".json.gz
+// MAGIC           #ecn_nm=$(echo $ecn_id_nm | awk -F! '{ print $2}')
+// MAGIC           #out_file="${reporting_date}_cigna-health-life-insurance-company_${ecn_nm}_in-network-rates.json.gz"
+// MAGIC           #mv /local_disk0/tmp/"$file_name".json.gz /dbfs/mnt/ct-datashare-external-output-mount/"$out_file"
+// MAGIC       fi
+// MAGIC       cd ..
+// MAGIC     else
+// MAGIC       echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: $ecn_id_nm: is not a CSN because it doesn't begin with 'CN'; Skipping header and body stitching"
+// MAGIC     fi
+// MAGIC }
+// MAGIC 
+// MAGIC export -f combine_header_and_body
+// MAGIC 
+// MAGIC echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: Merging header and body fragments for all the ECNs"
+// MAGIC parallel --ungroup --jobs $PARALLELISM combine_header_and_body ::: "${header_array[@]}"
+// MAGIC 
+// MAGIC echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: Completed generation of INN MRF for all the ECNs"
+// MAGIC #### cleanup ####
+// MAGIC 
+// MAGIC echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: Cleaning up temp files and directories"
+// MAGIC rm -f /local_disk0/tmp/ecn_list.txt
+// MAGIC rm -f /local_disk0/tmp/non_unique_body_array.txt
+// MAGIC rm -f /local_disk0/tmp/body_array.txt
+// MAGIC 
+// MAGIC echo "$(date +%Y-%m-%dT%H:%M:%S.%3N%z): inn-mrf-gen-step-3: File stitch completed"
+
+// COMMAND ----------
+
+try {
+  dbutils.fs.unmount(s"/mnt/$s3_input_body_mount_name")
+  dbutils.fs.unmount(s"/mnt/$s3_input_header_mount_name")
+  dbutils.fs.unmount(s"/mnt/$s3_output_mount_name")
+  dbutils.fs.unmount(s"/mnt/$s3_output_body_mount_name")
+}  catch {
+  case ex: Exception => ex.printStackTrace()
+  case _: Throwable  => println("Throwable exception")
+}
+
